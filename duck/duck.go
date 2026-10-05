@@ -17,41 +17,74 @@ type Result struct {
 	Ducked bool
 }
 
+// busState 记录一条总线的说话状态。
+type busState struct {
+	speakers map[string]bool // 当前在说话的人
+	released bool            // 是否经历过「最后一人停止说话」
+	lastEnd  int64           // 最后一人停止说话的时刻
+}
+
 // Duck 是闪避台账。
 type Duck struct {
 	Threshold float64
 	ReleaseMs int64
 
-	buses   map[string]bool
+	buses   map[string]*busState
 	seen    map[string]bool
 	Scanned int
+}
+
+func (d *Duck) state(bus string) *busState {
+	st, ok := d.buses[bus]
+	if !ok {
+		st = &busState{speakers: map[string]bool{}}
+		d.buses[bus] = st
+	}
+	return st
+}
+
+// ducked 判定某条总线在 at 时刻是否应被压低。
+func (d *Duck) ducked(st *busState, at int64) bool {
+	if len(st.speakers) > 0 {
+		return true
+	}
+	if st.released && at-st.lastEnd <= d.ReleaseMs {
+		return true
+	}
+	return false
 }
 
 // Handle 处理一条事件，返回该总线当前的增益。
 func (d *Duck) Handle(ev Event) Result {
 	if d.buses == nil {
-		d.buses = map[string]bool{}
+		d.buses = map[string]*busState{}
 	}
 	if d.seen == nil {
 		d.seen = map[string]bool{}
 	}
-	d.seen[ev.ID] = true
+	d.Scanned++
 
-	switch ev.Action {
-	case "start":
-		d.buses[ev.Bus] = true
-	case "end":
-		d.buses[ev.Bus] = false
-	}
+	st := d.state(ev.Bus)
 
-	ducked := false
-	for _, on := range d.buses {
-		d.Scanned++
-		if on {
-			ducked = true
+	// 幂等：同一个 eventID 只处理一次。
+	if !d.seen[ev.ID] {
+		d.seen[ev.ID] = true
+		switch ev.Action {
+		case "start":
+			st.speakers[ev.Speaker] = true
+		case "end":
+			if _, ok := st.speakers[ev.Speaker]; ok {
+				delete(st.speakers, ev.Speaker)
+				if len(st.speakers) == 0 {
+					st.released = true
+					st.lastEnd = ev.At
+				}
+			}
 		}
 	}
-	if !ducked {
+
+	// 豁免覆盖层：exempt 音源不受闪避影响。
+	if ev.Exempt || !d.ducked(st, ev.At) {
 		return Result{Gain: 1, Ducked: false}
 	}
 	return Result{Gain: d.Threshold, Ducked: true}
